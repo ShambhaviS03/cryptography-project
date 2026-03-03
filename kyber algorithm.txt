@@ -1,0 +1,210 @@
+!pip install oqs
+try :
+  import oqs
+except Exception:
+  try:
+      import sys,subprocess
+      subprocess.run([sys.executable,"-m","pip","install","--quiet","liboqs"],check=false)
+  except Exception:
+        pass
+try:
+    import pqcrypto
+except Exception:
+    try:
+        import sys,subprocess
+        subprocess.run([sys.executable,"-m","pip","install","--quiet","pqcrypto"],check=false)
+    except Exception:
+        pass
+    
+    try:
+        import kyber_py
+    except Exception:
+        try:
+            import sys,subprocess
+            subprocess.run([sys.executable,"-m","pip","install","--quiet","kyber-py"],check=false)
+        except Exception:
+            pass
+            
+import os,base64,sys
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+
+def derive_aes_key(shared_secret:bytes,info:bytes=b"pqc-aes-key",length: int=32)->bytes:
+    hkdf=HKDF(algorithm=hashes.SHA256(),length=length,salt=None, info=info)
+    return hkdf.derive(shared_secret)
+
+def aesgcm_encrypt_bytes(
+    key: bytes,
+    plaintext: bytes,
+    aad: bytes | None = None
+) -> bytes:
+    aesgcm = AESGCM(key)
+    nonce = os.urandom(12)
+    ct = aesgcm.encrypt(nonce, plaintext, aad)
+    return nonce + ct
+
+
+def aesgcm_decrypt_bytes(
+    key: bytes,
+    nonce_and_ct: bytes,
+    aad: bytes | None = None
+) -> bytes:
+    nonce = nonce_and_ct[:12]
+    ct = nonce_and_ct[12:]
+    aesgcm = AESGCM(key)
+    return aesgcm.decrypt(nonce, ct, aad)
+
+
+# -------- Step A: try to generate a real Kyber shared secret --------
+shared_secret = None
+kem_method_used = None
+
+
+# 1) Try liboqs / pyOQS (oqs module)
+'''
+try:
+    import oqs
+    kem_name = "Kyber512"
+     # create an object for client (keypair owner)
+    with oqs.KeyEncapsulation(kem_name) as client:
+        public_key = client.generate_keypair()
+
+        # server encapsulates to the client's public key
+        with oqs.KeyEncapsulation(kem_name) as server:
+            ciphertext, shared_secret_server = server.encap_secret(public_key)
+
+        # client decapsulates to recover the shared secret
+        shared_secret_client = client.decap_secret(ciphertext)
+
+        if shared_secret_client == shared_secret_server:
+            shared_secret = shared_secret_client
+            kem_method_used = f"liboqs ({kem_name})"
+
+except Exception as e:
+    # ignore and try other libs
+pass'''
+
+
+# 2) Try kyber-py (pure python kyber implementation) if present
+if shared_secret is None:
+    try:
+        from kyber_py.kyber import Kyber512
+
+        pk, sk = Kyber512.keygen()
+        key, ct = Kyber512.encaps(pk)
+        key2 = Kyber512.decaps(sk, ct)
+
+        if key == key2:
+            shared_secret = key
+            kem_method_used = "kyber-py (Kyber512)"
+
+    except Exception:
+        pass
+
+
+# 3) Try pqcrypto (some wrappers expose keypair/encapsulate/decapsulate) - best-effort
+if shared_secret is None:
+    try:
+        # many pqcrypto wrappers present different APIs; try common names
+        from pqcrypto.kem import kyber512
+
+        pk, sk = kyber512.generate_keypair()
+        ct, ss = kyber512.encrypt(pk)   # some wrappers use encrypt/encapsulate naming
+        ss2 = kyber512.decrypt(sk, ct)
+
+        if ss == ss2:
+            shared_secret = ss
+            kem_method_used = "pqcrypto.kem.kyber512"
+
+    except Exception:
+        pass
+
+
+# 4) Fallback: simulate a shared secret (secure random) if above fails
+if shared_secret is None:
+    shared_secret = os.urandom(32)
+    kem_method_used = "SIMULATED_RANDOM (fallback)"
+
+
+# === USER INPUT SECTION ===
+user_text = input("Enter the text you want to encrypt: ")
+
+
+# --- Step B: derive AES key and encrypt a sample text ---
+aes_key = derive_aes_key(shared_secret, info=b"pqc-aes-key-demo")
+sample_text = user_text
+plaintext = sample_text.encode("utf-8")
+cipher_blob = aesgcm_encrypt_bytes(aes_key, plaintext)
+
+
+# Print outputs (base64) so you can copy/paste manually
+b64_aes_key = base64.b64encode(aes_key).decode("ascii")
+b64_cipher_blob = base64.b64encode(cipher_blob).decode("ascii")
+b64_shared_secret = base64.b64encode(shared_secret).decode("ascii")
+
+print("\n=== Demo outputs (base64) ===")
+print(f"KEM method used: {kem_method_used}")
+print()
+
+print("Derived AES-256 key (base64)  <-- this is the symmetric key you can paste for manual decryption:")
+print(b64_aes_key)
+print()
+
+print("Shared secret (base64)  <-- (optional): shows the raw shared secret from KEM (or simulated):")
+print(b64_shared_secret)
+print()
+
+print("Ciphertext blob (nonce||ciphertext||tag) (base64)  <-- paste this to decrypt:")
+print(b64_cipher_blob)
+print("\n============================\n")
+
+
+#Step C: interactive manual decrypt using user input ===
+print("Paste the AES key and ciphertext below to decrypt.")
+
+try:
+    # In Colab, input() works. If running where input() is not allowed, skip this section.
+    user_key_b64 = input(
+        "Paste AES key (base64) (or press Enter to use printed key): "
+    ).strip()
+    if user_key_b64 == "":
+        user_key_b64 = b64_aes_key
+
+    user_ct_b64 = input(
+        "Paste ciphertext blob (base64) (or press Enter to use printed ciphertext): "
+    ).strip()
+    if user_ct_b64 == "":
+        user_ct_b64 = b64_cipher_blob
+
+    try:
+        user_key = base64.b64decode(user_key_b64)
+        user_ct = base64.b64decode(user_ct_b64)
+
+        recovered = aesgcm_decrypt_bytes(user_key, user_ct)
+        print("\nDECRYPTION SUCCESS — recovered plaintext:")
+        print(recovered.decode("utf-8"))
+
+    except Exception as e:
+        print("\nDecryption failed. Error:", e)
+        print("Check that you pasted the correct base64 AES key and ciphertext blob.")
+
+except Exception as e:
+    print(
+        "\nInteractive input not available in this environment. "
+        "Use the printed key and ciphertext manually in another script to decrypt."
+    )
+
+    # Show small snippet to decrypt offline
+    print("\nExample offline decrypt snippet:")
+    print("from base64 import b64decode")
+    print("from cryptography.hazmat.primitives.ciphers.aead import AESGCM")
+    print()
+    print("def aesgcm_decrypt_bytes(key, nonce_and_ct):")
+    print("    nonce = nonce_and_ct[:12]")
+    print("    ct = nonce_and_ct[12:]")
+    print("    return AESGCM(key).decrypt(nonce, ct, None)")
+    print()
+    print("key = b64decode('PASTE_KEY_HERE')")
+    print("ct = b64decode('PASTE_CIPHERTEXT_HERE')")
+    print("print(aesgcm_decrypt_bytes(key, ct).decode())")
